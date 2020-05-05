@@ -37,6 +37,60 @@ import System.IO
 import System.Mem
 import Text.Printf
 
+import Emu.EmuM
+import Emu.Devices
+import Emu.GDBStub
+import Emu.Utils
+
+
+
+rvemu = do
+  args <- getArgs
+  let ramsize = 256*1025*1024
+  let filename = args !! 0
+  withBinaryFile filename ReadMode $ \hnd -> do
+    putStrLn $ "loadling file " ++ filename
+    c <- BL.hGetContents hnd
+    flip runStateT emptyVMst $  do
+
+      -- BOOT SEQUENCE :D
+    --printRegs
+      liftIO $ colorize Green
+      liftIO $ putStrLn $ "initializing RAM " ++ (show ramsize) ++ " (0x" ++ (showHex ramsize ") bytes")
+      liftIO $ colorize ResetAll
+      initRam $ 256*1024*1024 -- 1 MiB
+      --printRam
+      setPC 0x0 -- 4000000
+      pc <- getPC
+      liftIO $ colorize Green
+      liftIO $ putStrLn $ "starting at address: 0x" ++ (showHex (fromIntegral pc) "")
+      liftIO $ colorize ResetAll
+      loadBSToRam c pc
+      --printRam
+
+      registerDevice (MemRegion {memstart = 1024, memsize = 4})
+                     (RegionAccessFns { wrfn = printIOWr
+                                      , rdfn = dummyIORd})
+
+      irqchan <- createIrqController
+
+--      startSuperStupidTimer irqchan
+
+      emuRunning <- liftIO $ atomically $ newTVar False
+
+      dbgchan <- startGDBServer
+
+      liftIO $ colorize Green
+      liftIO $ putStrLn "starting CPU loop"
+      liftIO $ colorize ResetAll
+      --liftIO $ threadDelay 2000000
+      -- MAIN RUN
+      cpuLoop emuRunning irqchan dbgchan
+
+      return ()
+    return ()
+
+
 getOpcode insn = insn .&. 63
 getOp6'2 insn = insn `shiftR` 2 .&. 31
 getRd insn = insn `shiftR` 7 .&. 31
@@ -63,169 +117,9 @@ getIform insn = (getOpcode insn, getRd insn, getFunct3 insn, getRs1 insn, getImm
 getSform insn = (getOpcode insn, getImm4'0 insn, getFunct3 insn, getRs1 insn, getRs2 insn, getImm11'5 insn)
 getUform insn = (getOpcode insn, getRd insn, getImm31'12 insn)
 
-              -- pos -> data
-              -- write is of arbitrary size, we are an emulator :D
-type WrAccessFn = Int -> ByteString -> IO ()
-              -- read access is always 32 bit
-type RdAccessFn = Int -> IO ByteString
-
-data MemRegion = MemRegion
-               { memstart :: Int
-               , memsize :: Int } deriving (Eq, Show)
-
-instance Ord MemRegion where
-  compare a b = compare (memstart a) (memstart b)
-
-data RegionAccessFns = RegionAccessFns
-                     { wrfn :: WrAccessFn
-                     , rdfn :: RdAccessFn }
-instance Show RegionAccessFns where
-  show x = "RegionAccessFns"
-
-type Addr = Int
-
-data VMst = EmuS
-          { regs :: [Int]
-          , pc :: Int
-          , ram :: ByteString
-          , ramsize :: Int
-          , iomaps :: Map MemRegion RegionAccessFns
-          , breakpoints :: Set Addr
-          , replyFn :: (BS.ByteString -> IO ())
-          }
-
-emptyVMst = EmuS { regs = [0 | _ <- [0..31]]
-                 , ram = BL.empty
-                 , ramsize = 0
-                 , pc = 0
-                 , iomaps = Data.Map.Strict.empty
-                 , breakpoints = Data.Set.empty
-                 , replyFn = \_ -> return ()
-                 }
-
-type EmuM a = StateT VMst IO a
-
-data DbgCmd = DbgGetRegs (BS.ByteString -> IO ())
-            | DbgGetReg Int (BS.ByteString -> IO ())
-            | DbgReadMem Int Int (BS.ByteString -> IO ())
-            | DbgAddBreakpoint Int (BS.ByteString -> IO ())
-            | DbgDelBreakpoint Int (BS.ByteString -> IO ())
-            | DbgWriteRegs
-            | DbgStatus (BS.ByteString -> IO ())
-            | DbgPause Bool (BS.ByteString -> IO ())
-            | DbgReset
-
-instance Show VMst where
-  show x = "Machine state: " ++ (show $ regs x)
-
--- newtype EmuT m a = EmuT {
---     runEmuT :: m (EmuM a)
---   }
--- 
--- instance MonadTrans EmuT where
---   lift m = EmuT $ liftM m
-
-getRegs :: EmuM [Int]
-getRegs = do
-  s <- get
-  return $ regs s
-
-initRegs :: EmuM ()
-initRegs = do
-  s <- get
-  put $ s { regs = [0 | _ <- [0..31]] }
-
-initRam :: Int -> EmuM ()
-initRam size = do
-  s <- get
-  put $ s { ram = BL.pack [0 | _ <- [1..size]]
-          , ramsize = size }
-
-loadBSToRam :: BL.ByteString -> Int -> EmuM ()
-loadBSToRam bs pos = do
-  s <- get
-  let rm = ram s
-      maps = iomaps s
---  liftIO $ print "loading BS to"
---  liftIO $ print pos
---  liftIO $ print bs
---  liftIO $ print maps
-
-  case Data.Map.Strict.lookup (MemRegion pos 4 ) maps of
-    Just (RegionAccessFns wr rd) -> liftIO $ wr pos bs
-    Nothing -> put $ s { ram = BL.concat [ BL.take (fromIntegral pos) rm
-                            , bs
-                            , (BL.drop ((fromIntegral $ pos)+(BL.length bs)) rm) ] }
-
-getReg :: Int -> EmuM Int
-getReg x = do
-  s <- get
-  case x of
-    _ | (x == 0x20) -> getPC
-    _ | (x > 31) -> do
-      liftIO $ print $ "invalid register number " ++ show x
-      return 0
-    _ | (x <= 31) -> return $ (regs s) !! x
-
-setReg :: Int -> Int -> EmuM ()
-setReg x val = do
-  s <- get
-  let rgs = regs s
-  when (x > 31) $ fail "invalid register number"
-  when (x > 0) $ put $ s { regs = Prelude.take (x) rgs ++ (val : Prelude.drop (x+1) rgs) }
-  return ()
-
-printRegs :: EmuM ()
-printRegs = do
-  r <- getRegs
-  liftIO $ putStrLn $ "Machine registers: " ++ show r
-
-printRam :: EmuM ()
-printRam = do
-  r <- get
-  liftIO $ putStrLn $ "Machine RAM: " ++ (show $ ram r)
-
-ramSize :: EmuM Int
-ramSize = do
-  s <- get
-  return $ ramsize s
 
 
-signExtend :: Word32 -> Int -> Int
-signExtend word signbit = fromMaybe 0 $ toIntegralSized word
 
-getPC :: EmuM Int
-getPC = do
-  s <- get
-  return $ pc s
-
-setPC :: Int -> EmuM ()
-setPC pc = do
-  s <- get
-  put $ s {pc = pc}
-  return ()
-
-advancePC :: EmuM ()
-advancePC = do
-  pc <- getPC
-  rs <- ramSize
---  liftIO $ System.IO.putStr $ "advancing PC from " ++ (showHex pc "")
-  setPC $ (pc + 4) `mod` rs
-  pc' <- getPC
---  liftIO $ System.IO.putStrLn $ " to " ++ (showHex pc' "")
-  return ()
-
-getRamAtPC :: EmuM ByteString
-getRamAtPC = do
-  pc <- getPC
-  s <- get
-  return $ BL.drop (fromIntegral pc) $ ram s
-  
-getRamAt :: Int -> EmuM ByteString
-getRamAt a = do
-  s <- get
-  let addr = (fromIntegral a)
-  return $ BL.drop addr $ ram s
 
 
 ---- read mem bracket
@@ -283,254 +177,6 @@ processIrqs chan = do
 
     Nothing -> return ()
 
-crc :: [Char] -> String
-crc bs = '$' : bs ++ (printf "#%02x" (sum' :: Int))
-  where sum' = (Prelude.foldl (+) 0 $ Prelude.map (Data.Char.ord) (bs)) `mod` 256
-
-
-processDbg emuRunning irqchan dbgchan = do
-  cmd <- liftIO $ atomically $ tryReadTBChan dbgchan
-  case cmd of
-    Nothing -> return ()
-    Just DbgReset -> do
-      setPC 0
-      mapM_ (setReg 0) [0..31]
-      return ()
-    Just (DbgStatus sndfn) -> do
-      notpaused <- liftIO $! atomically $ readTVar emuRunning
-      liftIO $ print $ crc "1"
-      when notpaused $ liftIO $ sndfn $ BS8.pack $ crc "1"
-      when (not notpaused) $ liftIO $ sndfn $ BS8.pack $ crc ""
-    Just (DbgGetRegs sndfn) -> do
-      regs <- getRegs
-      --let rgs = fmap (printf "%08x") regs
-      let rgs = fmap registerToHex regs
-      liftIO $ sndfn $ BS8.pack $ crc $ Prelude.concat rgs
-      return ()
-    Just (DbgGetReg num sndfn) -> do
-      reg <- getReg num
---      let rgs = printf "%08x" reg
-      liftIO $ sndfn $ BS8.pack $ crc $ registerToHex reg -- rgs
-      return ()
-    Just (DbgReadMem loc sz sndfn) -> do
-      s <- ramSize
-      if loc + sz < s then do
-        b <- getRamAt loc
-        let nums = [fromIntegral $ BL.head $ (BL.drop (fromIntegral cc) b) | cc <- [0..sz-1]] :: [Int]
-            rgs = Prelude.concat $ Prelude.map (\n -> printf "%02x" n) nums
-        liftIO $ sndfn $ BS8.pack $ crc $ rgs
-      else
-        liftIO $ sndfn $ BS8.pack $ crc $ "E00"
-      return ()
-    Just (DbgPause p sndfn) -> do
-      liftIO $ atomically $ writeTVar emuRunning (not p)
-      liftIO $ print "pauzaiaiaiaiaing"
-      liftIO $ print (not p)
-      liftIO $ sndfn $ BS8.pack $ crc $ "OK"
-    Just (DbgAddBreakpoint addr sndfn) -> do
-      s <- get
-      let brs = breakpoints s
-      put $ s { breakpoints = addr `Data.Set.insert` brs
-              , replyFn = sndfn }
-      liftIO $ sndfn $ BS8.pack $ crc $ "OK"
-      return ()
-    Just (DbgDelBreakpoint addr sndfn) -> do
-      s <- get
-      let brs = breakpoints s
-      put $ s { breakpoints = addr `Data.Set.delete` brs }
-      liftIO $ sndfn $ BS8.pack $ crc $ "OK"
-      return ()
-
-startGDBServer :: EmuM (TBChan DbgCmd)
-startGDBServer = do
-  liftIO $ do
-    chan <- atomically $ newTBChan 1
-    forkIO $ do
-      colorize Green
-      putStrLn "starting gdbserver thread"
-      colorize ResetAll
-      serve (Host "127.0.0.1") "4243" $ \(connectionSocket, remoteAddr) -> do
-        putStrLn $ "TCP connection established from " ++ show remoteAddr
-        forever $ do
-          mbs <- recv connectionSocket 1024
-          case mbs of
-            Just bs' -> do
-              let bs = BS.dropWhile (\x->x `BL.elem` "+-") bs'
-              BS.putStr bs'
-              case bs of
-                bs | "$" `BS.isPrefixOf` bs -> do
-                  putStrLn "got GDB packet"
-                  debugFn bs chan connectionSocket
-                "\3" -> do
-                  send connectionSocket "+"
-                  atomically $ writeTBChan chan (DbgPause True (send connectionSocket))
-                  send connectionSocket $ BS8.pack $ crc $ "T05core:0;" --20:" ++ (registerToHex pc) ++ ";core:0;"
-                _ -> do
-                  colorize Red
-                  BL.putStr $ "got NOT GDB packet: "
---                  BS.putStr bs
-                  print (BS.unpack bs)
-                  colorize ResetAll
-            Nothing -> return ()
-    return chan
-  where
-    debugFn s chan connectionSocket | "$g" `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $g"
-      colorize ResetAll
-      send connectionSocket "+"
-      atomically $ writeTBChan chan (DbgGetRegs (send connectionSocket))
-    debugFn s chan connectionSocket | "$!" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "OK"
-    debugFn s chan connectionSocket | "$?" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "T08thread:01;"
-    debugFn s chan connectionSocket | "$R" `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $R"
-      colorize ResetAll
-      atomically $ writeTBChan chan (DbgReset)
---    debugFn s chan connectionSocket | "$v" `BS.isPrefixOf` s = do
---      print "ERPLY"
---      send connectionSocket "+"
---      send connectionSocket $ BS8.pack $ crc ""
-    debugFn s chan connectionSocket | "$m" `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $m"
-      colorize ResetAll
-      let dropped = Prelude.drop 2 $ BS8.unpack s
-          [(loc, rest')] = readHex dropped
-          [(size, _)] = readHex $ Prelude.drop 1 rest'
-      send connectionSocket "+"
-      atomically $ writeTBChan chan (DbgReadMem loc size (send connectionSocket))
-
-    debugFn s chan connectionSocket | "$p" `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $p"
-      colorize ResetAll
-      let [(rn, rest')] = readHex $ BS8.unpack $ BS8.drop 2 s
-      send connectionSocket "+"
-      atomically $ writeTBChan chan (DbgGetReg rn (send connectionSocket))
-
-    debugFn s chan connectionSocket | "$c" `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $c"
-      colorize ResetAll
-      send connectionSocket "+"
-      atomically $ writeTBChan chan (DbgPause False (send connectionSocket))
-
-    debugFn s chan connectionSocket | "$C" `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $C"
-      colorize ResetAll
-      send connectionSocket "+"
-      atomically $ writeTBChan chan (DbgPause False (send connectionSocket))
-
-    debugFn s chan connectionSocket | "$H" `BS.isPrefixOf` s = do
-      let pckt = BS.drop 2 s
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "OK"
-      --debugFn (BS.concat ["$",pckt]) chan connectionSocket
-
-
-    debugFn s chan connectionSocket | "$Z0," `BS.isPrefixOf` s = debugFn (BS.concat ["$Z1",(BS.drop 3 s)]) chan connectionSocket
-    debugFn s chan connectionSocket | "$z0," `BS.isPrefixOf` s = debugFn (BS.concat ["$z1",(BS.drop 3 s)]) chan connectionSocket
-    debugFn s chan connectionSocket | "$Z1," `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $Z1"
-      colorize ResetAll
-      send connectionSocket "+"
-      let dropped = Prelude.drop 4 $ BS8.unpack s
-          [(addr, rest')] = readHex dropped
-      atomically $ writeTBChan chan (DbgAddBreakpoint addr (send connectionSocket))
-
-    debugFn s chan connectionSocket | "$z1," `BS.isPrefixOf` s = do
-      colorize Yellow
-      putStrLn "got $z1"
-      colorize ResetAll
-      send connectionSocket "+"
-      let dropped = Prelude.drop 4 $ BS8.unpack s
-          [(addr, rest')] = readHex dropped
-      atomically $ writeTBChan chan (DbgDelBreakpoint addr (send connectionSocket))
-
-
-    debugFn s chan connectionSocket | "$vCont?#" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "vCont;cs"
-
-    debugFn s chan connectionSocket | "$qfThreadInfo" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "m01"
-
-    debugFn s chan connectionSocket | "$qsThreadInfo" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "l"
-
-    debugFn s chan connectionSocket | "$qOffsets" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "TextSeg=0"
-
-    debugFn s chan connectionSocket | "$qAttached" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "1"
-
-    debugFn s chan connectionSocket | "$qSupported" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      send connectionSocket $ BS8.pack $ crc "PacketSize=1000;qXfer:features:read+;hwbreak+"
-      --send connectionSocket $ BS8.pack $ crc "PacketSize=1000;qXfer:features:read+;multiprocess+;hwbreak+"
-
-    debugFn s chan connectionSocket | "$qTStatus#" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      atomically $ writeTBChan chan (DbgStatus (send connectionSocket))
-
-    debugFn s chan connectionSocket |"$qXfer:features:read:target.xml" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      xml <- System.IO.readFile "target.xml"
-      send connectionSocket $ BS8.pack $ crc "l<?xml version=\"1.0\"?><!DOCTYPE target SYSTEM \"gdb-target.dtd\"><target><xi:include href=\"riscv-32bit-cpu.xml\"/><xi:include href=\"riscv-32bit-fpu.xml\"/><xi:include href=\"riscv-32bit-csr.xml\"/></target>" -- #bb"
---      send connectionSocket $ BS8.pack $ crc $ (T.unpack $ T.strip $ T.pack xml)
-
-    debugFn s chan connectionSocket |"$qXfer:features:read:riscv-32bit-cpu.xml" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      xml <- System.IO.readFile "riscv-32bit-cpu.xml"
-      send connectionSocket $ BS8.pack $ crc $ 'l' : xml
-
-    debugFn s chan connectionSocket |"$qXfer:features:read:riscv-32bit-csr.xml" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      xml <- System.IO.readFile "riscv-32bit-csr.xml"
-      let dropped = Prelude.drop 41 $ BS8.unpack s
-          [(first', rest')] = readHex dropped
-          [(second', _)] = readHex $ Prelude.drop 1 rest'
-      liftIO $ print dropped
-      liftIO $ print first'
-      liftIO $ print second'
-      fsize <- getFileSize "riscv-32bit-csr.xml"
-      let msgprefix = if ((fromMaybe 0 fsize) - (fromIntegral first')) < (fromIntegral second') then 'l'
-                                                    else 'm'
-      send connectionSocket $ BS8.pack $ crc $ msgprefix : (Prelude.take (second') (Prelude.drop first' xml))
-
-    debugFn s chan connectionSocket |"$qXfer:features:read:riscv-32bit-fpu.xml" `BS.isPrefixOf` s = do
-      send connectionSocket "+"
-      xml <- System.IO.readFile "riscv-32bit-fpu.xml"
-      send connectionSocket $ BS8.pack $ crc $ 'l' : xml
-
-    debugFn s chan connectionSocket = do
-                  colorize Red
-                  BL.putStr $ "got unknown GDB packet: "
-                  BS.putStrLn s
-                  colorize ResetAll
-                  send connectionSocket "+"
-                  send connectionSocket $ BS8.pack $ crc $ ""
-
-
-getFileSize :: FilePath -> IO (Maybe Integer)
-getFileSize path = handle handler
-                   $ bracket (openFile path ReadMode) (hClose) (\h -> do size <- hFileSize h
-                                                                         return $ Just size)
-  where
-    handler :: SomeException -> IO (Maybe Integer)
-    handler _ = return Nothing
-
 
 
 processBreakPoints :: TVar Bool -> EmuM ()
@@ -544,16 +190,6 @@ processBreakPoints emuRunning = do
       replyFn s $ BS8.pack $ crc $ "T0520:" ++ (registerToHex pc) ++ ";core:0;"
       atomically $ writeTVar emuRunning False
     False -> return ()
-
-registerToHex :: Int -> String
-registerToHex reg =
-     (o reg 3)
-  ++ (o reg 2)
-  ++ (o reg 1)
-  ++ (o reg 0)
-  where
-    o :: Int -> Int -> String
-    o reg x = Prelude.take 2 $ Prelude.drop (x*2) $ (printf "%08x" reg)
 
 cpuLoop :: TVar Bool -> TBChan Int -> TBChan DbgCmd -> EmuM ()
 cpuLoop emuRunning irqchan dbgchan = do
@@ -857,74 +493,4 @@ cpuLoop emuRunning irqchan dbgchan = do
 
 
 
-startSuperStupidTimer :: TBChan Int -> EmuM ()
-startSuperStupidTimer irqchan = do
-      liftIO $ forkIO $ forever $ do
-        threadDelay $ 2*100000
-        atomically $ writeTBChan irqchan 0
-      return ()
-
-rvemu = do
-  args <- getArgs
-  let ramsize = 256*1025*1024
-  let filename = args !! 0
-  withBinaryFile filename ReadMode $ \hnd -> do
-    putStrLn $ "loadling file " ++ filename
-    c <- BL.hGetContents hnd
-    flip runStateT emptyVMst $  do
-
-      -- BOOT SEQUENCE :D
-    --printRegs
-      liftIO $ colorize Green
-      liftIO $ putStrLn $ "initializing RAM " ++ (show ramsize) ++ " (0x" ++ (showHex ramsize ") bytes")
-      liftIO $ colorize ResetAll
-      initRam $ 256*1024*1024 -- 1 MiB
-      --printRam
-      setPC 0x0 -- 4000000
-      pc <- getPC
-      liftIO $ colorize Green
-      liftIO $ putStrLn $ "starting at address: 0x" ++ (showHex (fromIntegral pc) "")
-      liftIO $ colorize ResetAll
-      loadBSToRam c pc
-      --printRam
-
-      registerDevice (MemRegion {memstart = 1024, memsize = 4})
-                     (RegionAccessFns { wrfn = printIOWr
-                                      , rdfn = dummyIORd})
-
-      irqchan <- createIrqController
-
---      startSuperStupidTimer irqchan
-
-      emuRunning <- liftIO $ atomically $ newTVar False
-
-      dbgchan <- startGDBServer
-
-      liftIO $ colorize Green
-      liftIO $ putStrLn "starting CPU loop"
-      liftIO $ colorize ResetAll
-      --liftIO $ threadDelay 2000000
-      -- MAIN RUN
-      cpuLoop emuRunning irqchan dbgchan
-
-      return ()
-    return ()
-    
-data Colors = Default
-            | Red
-            | Green
-            | Yellow
-            | ResetAll
-            | Bold
-            | ResetBold
-
-colorize Default    = putStr "\x1B[39m"
-colorize Red        = putStr "\x1B[31m"
-colorize Green      = putStr "\x1B[32m"
-colorize Yellow     = putStr "\x1B[33m"
-
-colorize Bold       = putStr "\x1B[1m"
-colorize ResetBold  = putStr "\x1B[21m"
-
-colorize ResetAll   = putStr "\x1B[0m"
 

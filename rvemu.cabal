@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: debda3630db7872a9809701e15581dd59375bda8e25d55577df4e95db1c0d33c
+-- hash: 62ea3a42ab2620eab12bf2ac3e7a6856f16f07e9c7c67167f3355dc0c1e57837
 
 name:           rvemu
 version:        0.1.0.0
@@ -27,6 +27,10 @@ source-repository head
 
 library
   exposed-modules:
+      Emu.Devices
+      Emu.EmuM
+      Emu.GDBStub
+      Emu.Utils
       Lib
       Rvemu
   other-modules:
