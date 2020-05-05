@@ -7,7 +7,7 @@ This stuff is ugly and slow but was fun to write.
 
 To try:
 
-You need gdb-multiarch (on ubuntu), riscv64-unknown-elf-gcc
+You need haskell stack, gdb-multiarch (on ubuntu), riscv64-unknown-elf-gcc
 and riscv64-unknown-elf-objcopy.
 
 $ stack test
