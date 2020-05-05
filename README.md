@@ -1,6 +1,8 @@
 # rvemu
 Yet another RISC-V emulator, this time in Haskell.
 
+FAR FROM COMPLETE. Contains bugs! Even basic ISA isn't done properly yet.
+
 This stuff is ugly and slow but was fun to write.
 
 To try:
